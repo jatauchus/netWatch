@@ -40,7 +40,15 @@
   #followBtn { bottom: calc(env(safe-area-inset-bottom) + 96px); }
   #listBtn   { bottom: calc(env(safe-area-inset-bottom) + 158px); }
   #legendBtn { bottom: calc(env(safe-area-inset-bottom) + 220px); font-size:18px; }
-  #followBtn.on { background:var(--blue); color:#fff; }
+  #followBtn.on, #satBtn.on { background:var(--blue); color:#fff; }
+  #satBtn { right:14px; width:52px; height:52px; background:#fff; font-size:22px; bottom: calc(env(safe-area-inset-bottom) + 282px); }
+  #editBar { position:fixed; z-index:1450; left:10px; right:10px; bottom:calc(env(safe-area-inset-bottom) + 18px); max-width:520px; margin:0 auto;
+             background:#1f2937; color:#fff; border-radius:16px; padding:14px; box-shadow:0 8px 24px rgba(0,0,0,.4); display:none; }
+  #editBar.show { display:block; }
+  .eb-btns { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px; }
+  .eb-btns button { padding:14px; font-size:18px; font-weight:800; border:none; border-radius:12px; cursor:pointer; }
+  .eb-save { background:var(--ball); color:var(--brand); } .eb-cancel { background:#fff; color:#111827; }
+  body.editing #reportBtn, body.editing #listBtn, body.editing #legendBtn, body.editing #followBtn { display:none; }
 
   .pin { width:30px; height:30px; border-radius:50%; border:3px solid #fff; box-shadow:0 1px 4px rgba(0,0,0,.45);
          display:flex; align-items:center; justify-content:center; color:#fff; font-size:14px; font-weight:800; }
@@ -133,6 +141,8 @@
 
 <button class="fab" id="legendBtn" aria-label="Map key and settings">⚙</button>
 <button class="fab" id="listBtn" aria-label="Court list">☰</button>
+<button class="fab" id="satBtn" aria-label="Satellite view">🛰</button>
+<div id="editBar"></div>
 <button class="fab" id="followBtn" aria-label="Follow my location">◎</button>
 <button class="fab" id="reportBtn">🎾 Report nearest court</button>
 
@@ -293,7 +303,14 @@ async function send(payload) {
 
 /* ---------- map ---------- */
 const map = L.map('map', { zoomControl: false, attributionControl: true }).setView([42.2780, -83.7400], 13);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+const streetLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+const satLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: 'Imagery © Esri' });
+let satOn = false;
+function setSatellite(on) {
+  satOn = on;
+  if (on) { map.removeLayer(streetLayer); satLayer.addTo(map); } else { map.removeLayer(satLayer); streetLayer.addTo(map); }
+  $('#satBtn').classList.toggle('on', on);
+}
 map.on('dragstart', () => setFollow(false));
 
 function drawMarkers() {
@@ -302,8 +319,8 @@ function drawMarkers() {
     seen.add(c.id);
     const s = statusOf(latestFor(c.id));
     const icon = L.divIcon({ className: '', iconSize: [38, 48], iconAnchor: [19, 46], html: pinHtml(s) });
-    if (markers[c.id]) { markers[c.id].setLatLng([c.lat, c.lng]).setIcon(icon); }
-    else { markers[c.id] = L.marker([c.lat, c.lng], { icon }).addTo(map).on('click', () => openCourt(c.id)); }
+    if (markers[c.id]) { if (c.id !== editingId) markers[c.id].setLatLng([c.lat, c.lng]).setIcon(icon); }
+    else { markers[c.id] = L.marker([c.lat, c.lng], { icon }).addTo(map).on('click', () => { if (!editingId) openCourt(c.id); }); }
     markers[c.id].bindTooltip(c.name, { direction: 'top', offset: [0, -44] });
   });
   Object.keys(markers).forEach(id => { if (!seen.has(id)) { map.removeLayer(markers[id]); delete markers[id]; } });
@@ -332,7 +349,7 @@ function startGps() {
 
 /* ---------- "Up ahead" questions, like Google Maps asking "Is the police still there?" ---------- */
 function checkUpAhead() {
-  if (!askOn || !me || alertCourt || $('#sheet').classList.contains('open') || !courts.length) return;
+  if (!askOn || !me || alertCourt || editingId || $('#sheet').classList.contains('open') || !courts.length) return;
   if (me.acc > 150) return; // GPS too fuzzy to say we're near a court
   const asked = store.get('nw_asked', {});
   const near = courts.map(c => ({ c, d: distMi(me, c) }))
@@ -425,6 +442,7 @@ function openCourt(id, refreshOnly) {
 
     <div class="links">
       <a href="https://www.google.com/maps/dir/?api=1&destination=${c.lat},${c.lng}" target="_blank" rel="noopener">Directions</a>
+      <button onclick="startDragPin('${esc(c.id)}')">Drag pin on map</button>
       <button onclick="askMovePin('${esc(c.id)}')">Move pin to my spot</button>
     </div>
     <div id="pinConfirm"></div>
@@ -478,6 +496,32 @@ function askMovePin(id) {
   $('#pinConfirm').innerHTML = `<div class="confirm">Move the <b>${esc(c.name)}</b> pin to where you're standing now (${fmtMi(d)} from the current pin)? Only do this if you're at the courts.
     <div><button style="background:var(--brand);color:#fff" onclick="movePin('${esc(id)}')">Move pin</button><button onclick="$('#pinConfirm').innerHTML=''">Cancel</button></div></div>`;
 }
+/* ---------- drag a pin from anywhere (satellite view) ---------- */
+let editingId = null, editStart = null;
+function startDragPin(id) {
+  const c = courts.find(x => x.id === id); if (!c) return;
+  closeSheet(); hideUpAhead(); setFollow(false);
+  editingId = id; editStart = L.latLng(c.lat, c.lng);
+  const m = markers[id]; m.dragging.enable(); m.setZIndexOffset(2000);
+  setSatellite(true); map.setView(editStart, 18);
+  $('#editBar').innerHTML = `<div><b>Moving ${esc(c.name)}</b><div class="meta" style="color:#d1d5db">Drag the pin onto the courts. You can zoom and pan too.</div></div>
+    <div class="eb-btns"><button class="eb-save">Save</button><button class="eb-cancel">Cancel</button></div>`;
+  $('#editBar').classList.add('show'); document.body.classList.add('editing');
+  $('#editBar .eb-cancel').onclick = () => endDragPin(false);
+  $('#editBar .eb-save').onclick = () => endDragPin(true);
+}
+async function endDragPin(save) {
+  const id = editingId, m = markers[id]; if (!id) return;
+  const ll = m.getLatLng();
+  m.dragging.disable(); m.setZIndexOffset(0);
+  $('#editBar').classList.remove('show'); document.body.classList.remove('editing');
+  editingId = null;
+  if (!save) { m.setLatLng(editStart); return; }
+  const r = await send({ type: 'movePin', courtId: id, lat: +ll.lat.toFixed(6), lng: +ll.lng.toFixed(6) }).catch(() => ({ ok: false }));
+  toast(r.ok ? 'Pin saved for everyone' : 'Couldn’t save the pin'); if (!r.ok) m.setLatLng(editStart);
+  await load();
+}
+
 async function movePin(id) {
   const r = await send({ type: 'movePin', courtId: id, lat: +me.lat.toFixed(6), lng: +me.lng.toFixed(6) }).catch(() => ({ ok: false }));
   toast(r.ok ? 'Pin moved — thanks!' : 'Couldn’t move the pin'); if (r.ok) { await load(); openCourt(id); }
@@ -530,6 +574,7 @@ function openLegend() {
 /* ---------- buttons ---------- */
 $('#followBtn').onclick = () => { setFollow(!following); if (!me) toast('Finding you…'); };
 $('#listBtn').onclick = openList;
+$('#satBtn').onclick = () => setSatellite(!satOn);
 $('#legendBtn').onclick = openLegend;
 $('#reportBtn').onclick = () => {
   if (!me) { toast('Waiting for GPS — or tap a court on the map'); return; }
